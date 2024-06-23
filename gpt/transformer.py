@@ -13,13 +13,16 @@ torch.manual_seed(1337)
 DATA_URL = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
 DATA_DIR = "../data"
 
-BATCH_SIZE = 4
-BLOCK_SIZE = 8
+BATCH_SIZE = 32
+BLOCK_SIZE = 256
 MAX_ITERS = 5000
-LEARNING_RATE = 1e-3
-EVAL_INTERVAL = 500
+LEARNING_RATE = 3e-4
+EVAL_INTERVAL = 100
 EVAL_ITERS = 200
-N_EMBEDDINGS = 32
+N_EMBEDDINGS = 384
+N_ATTENTION_HEADS = 6
+N_LAYERS = 6
+DROPOUT = 0.2
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 
@@ -96,19 +99,21 @@ def estimate_loss(model):
 
 
 class Head(nn.Module):
-    """One head of self-attention"""
+    """One head of self-attention (decoder style because of tril)"""
 
-    def __init__(self, head_size, n_embed):
+    def __init__(self, head_size):
         super().__init__()
         # linear projections that will be applied to all nodes (embeddings)
         self.key = nn.Linear(
-            n_embed, head_size, bias=False
+            N_EMBEDDINGS, head_size, bias=False
         )  # biases are typically not used
-        self.query = nn.Linear(n_embed, head_size, bias=False)
-        self.value = nn.Linear(n_embed, head_size, bias=False)
+        self.query = nn.Linear(N_EMBEDDINGS, head_size, bias=False)
+        self.value = nn.Linear(N_EMBEDDINGS, head_size, bias=False)
 
         # tril is not a Parameter of the model, so use a buffer
         self.register_buffer("tril", torch.tril(torch.ones(BLOCK_SIZE, BLOCK_SIZE)))
+
+        self.dropout = nn.Dropout(DROPOUT)
 
     def forward(self, x):
         B, T, C = x.shape
@@ -118,6 +123,7 @@ class Head(nn.Module):
         w = q @ k.transpose(-2, -1) * C**-0.5  # (B, T, C) @ (B, C, T) ---> (B, T, T)
         w = w.masked_fill(self.tril[:T, :T] == 0, float("-inf"))  # (B, T, T)
         w = F.softmax(w, dim=-1)
+        w = self.dropout(w)
 
         # weighted aggregation of values
         v = self.value(x)
@@ -125,15 +131,67 @@ class Head(nn.Module):
         return out
 
 
+class MultiHeadAttention(nn.Module):
+    """Multiple heads of self-attention running in parallel"""
+
+    def __init__(self, num_heads, head_size):
+        super().__init__()
+        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        self.proj = nn.Linear(N_EMBEDDINGS, N_EMBEDDINGS)
+        self.dropout = nn.Dropout(DROPOUT)
+
+    def forward(self, x):
+        # run all heads in parallel in a list
+        # then concatenate the outputs over the channel dimension
+        out = torch.cat([h(x) for h in self.heads], dim=-1)
+        # projection for residual
+        out = self.dropout(self.proj(out))
+        return out
+
+
+class FeedForward(nn.Module):
+
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(N_EMBEDDINGS, 4 * N_EMBEDDINGS),
+            nn.ReLU(),
+            nn.Linear(
+                4 * N_EMBEDDINGS, N_EMBEDDINGS
+            ),  # projection for going back to residual pathway
+            nn.Dropout(DROPOUT),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class Block(nn.Module):
+
+    def __init__(self):
+        super().__init__()
+        head_size = N_EMBEDDINGS // N_ATTENTION_HEADS
+        self.sa = MultiHeadAttention(N_ATTENTION_HEADS, head_size)
+        self.ffwd = FeedForward()
+        self.ln1 = nn.LayerNorm(N_EMBEDDINGS)
+        self.ln2 = nn.LayerNorm(N_EMBEDDINGS)
+
+    def forward(self, x):
+        x = x + self.sa(self.ln1(x))
+        x = x + self.ffwd(self.ln2(x))
+
+        return x
+
+
 class BigramLanguageModel(nn.Module):
 
-    def __init__(self, vocab_size, n_embed) -> None:
+    def __init__(self, vocab_size) -> None:
         super().__init__()
 
-        self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
-        self.position_embedding_table = nn.Embedding(BLOCK_SIZE, n_embed)
-        self.sa_head = Head(head_size=n_embed, n_embed=n_embed)
-        self.lm_head = nn.Linear(n_embed, vocab_size)
+        self.token_embedding_table = nn.Embedding(vocab_size, N_EMBEDDINGS)
+        self.position_embedding_table = nn.Embedding(BLOCK_SIZE, N_EMBEDDINGS)
+        self.blocks = nn.Sequential(*[Block() for _ in range(N_LAYERS)])
+        self.lm_head = nn.Linear(N_EMBEDDINGS, vocab_size)
 
     def forward(self, idx, targets=None):
         B, T = idx.shape
@@ -144,7 +202,7 @@ class BigramLanguageModel(nn.Module):
             torch.arange(T, device=device)
         )  # (T, C)
         x = tok_emb + pos_emb  # (B, T, C)
-        x = self.sa_head(x)  # apply self attention, (B, T, C)
+        x = self.blocks(x)
         logits = self.lm_head(x)  # (B, T, vocab_size)
 
         if targets is None:
@@ -178,7 +236,7 @@ class BigramLanguageModel(nn.Module):
         return idx
 
 
-model = BigramLanguageModel(vocab_size=vocab_size, n_embed=N_EMBEDDINGS)
+model = BigramLanguageModel(vocab_size=vocab_size)
 model.to(device)
 
 
