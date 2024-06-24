@@ -1,2 +1,12 @@
+blobfile
 ipykernel
+matplotlib
+python-dotenv
+requests
+tiktoken
+torchinfo
 wikipedia-api
+
+# Note: change this according to ur setup
+--extra-index-url https://download.pytorch.org/whl/cu121
+torch
